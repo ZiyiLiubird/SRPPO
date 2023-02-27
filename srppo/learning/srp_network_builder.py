@@ -14,24 +14,26 @@ class SRPBuilder(network_builder.A2CBuilder):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         return
-    
+
     class Network(network_builder.A2CBuilder.Network):
         def __init__(self, params, **kwargs):
+            actions_num = kwargs['actions_num']
+            input_shape = kwargs['input_shape']
             super().__init__(params, **kwargs)
-            actions_num = kwargs.pop('actions_num')
-            input_shape = kwargs.pop('input_shape')
             
             if self.has_cnn:
                 if self.permute_input:
                     input_shape = torch_ext.shape_whc_to_cwh(input_shape)
-            
+
             mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
-            
+            num_particles = kwargs['num_particles']
+
             self._build_pdf(ob_dim=mlp_input_shape, ac_dim=actions_num)
+            self._build_aux_critics(input_shape=input_shape, mlp_input_shape=mlp_input_shape, num_particles=num_particles)
 
         def load(self, params):
             super().load(params)
-            
+
             self._pdf_units = params['pdf']['units']
             self._pdf_activation = params['pdf']['activation']
             self._pdf_initializer = params['pdf']['initializer']
@@ -55,14 +57,16 @@ class SRPBuilder(network_builder.A2CBuilder):
             for p in self.parameters():
                 p.requires_grad = False
 
-        def _build_aux_critic(self,):
-            pass
+        def _build_aux_critics(self, input_shape, mlp_input_shape, num_particles):
+            self.aux_critics = nn.ModuleList([
+                self._build_aux_critic(input_shape=input_shape, mlp_input_shape=mlp_input_shape) for _ in range(num_particles)
+            ])
         
-        def _build_pdf(self, ob_shape, ac_dim):            
+        def _build_pdf(self, ob_dim, ac_dim):            
             self._pdf_mlp = nn.Sequential()
             
             mlp_args = {
-                'input_size' : ob_shape[0]+ac_dim, 
+                'input_size' : ob_dim+ac_dim, 
                 'units' : self._pdf_units, 
                 'activation' : self._pdf_activation, 
                 'dense_func' : torch.nn.Linear
@@ -82,8 +86,46 @@ class SRPBuilder(network_builder.A2CBuilder):
             
             torch.nn.init.uniform_(self._pdf_logits.weight, -PDF_LOGIT_INIT_SCALE, PDF_LOGIT_INIT_SCALE)
             torch.nn.init.zeros_(self._pdf_logits.bias) 
-
             return
+
+        def _build_aux_critic(self, input_shape, mlp_input_shape):
+            if self.has_cnn:
+                cnn_args = {
+                    'ctype' : self.cnn['type'], 
+                    'input_shape' : input_shape, 
+                    'convs' :self.cnn['convs'], 
+                    'activation' : self.cnn['activation'], 
+                    'norm_func_name' : self.normalization,
+                }
+                aux_critic_cnn = self._build_conv( **cnn_args)
+
+            mlp_args = {
+                'input_size' : mlp_input_shape, 
+                'units' : self.units, 
+                'activation' : self.activation, 
+                'norm_func_name' : self.normalization,
+                'dense_func' : torch.nn.Linear,
+                'd2rl' : self.is_d2rl,
+                'norm_only_first_layer' : self.norm_only_first_layer
+            }
+            if len(self.units) == 0:
+                out_size = mlp_input_shape
+            else:
+                out_size = self.units[-1]
+            aux_critic_mlp = self._build_mlp(**mlp_args)
+            aux_value = torch.nn.Linear(out_size, self.value_size)
+            aux_value_act = self.activations_factory.create(self.value_activation)
+            
+            aux_critic_network = nn.Sequential(*list(aux_critic_cnn), *list(aux_critic_mlp), aux_value, aux_value_act)
+            mlp_init = self.init_factory.create(**self.initializer)
+            for m in aux_critic_network.modules():
+                if isinstance(m, nn.Linear):
+                    mlp_init(m.weight)
+                    if getattr(m, 'bias', None) is not None:
+                        torch.nn.init.zeros_(m.bias)
+            return aux_critic_network
+
+
 
     def build(self, name, **kwargs):
         net = SRPBuilder.Network(self.params, **kwargs)
