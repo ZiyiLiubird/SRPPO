@@ -21,15 +21,11 @@ class SRPBuilder(network_builder.A2CBuilder):
             input_shape = kwargs['input_shape']
             super().__init__(params, **kwargs)
             
-            if self.has_cnn:
-                if self.permute_input:
-                    input_shape = torch_ext.shape_whc_to_cwh(input_shape)
-
-            mlp_input_shape = self._calc_input_size(input_shape, self.actor_cnn)
+            mlp_input_shape = input_shape[0]
             num_particles = kwargs['num_particles']
 
             self._build_pdf(ob_dim=mlp_input_shape, ac_dim=actions_num)
-            self._build_aux_critics(input_shape=input_shape, mlp_input_shape=mlp_input_shape, num_particles=num_particles)
+            self._build_aux_critics(mlp_input_shape=mlp_input_shape, num_particles=num_particles)
 
         def load(self, params):
             super().load(params)
@@ -41,12 +37,11 @@ class SRPBuilder(network_builder.A2CBuilder):
             return
 
         def eval_pdf(self, normalized_sa):
-            with torch.no_grad():
-                _pdf_logits = self._pdf_logits(self._pdf_mlp(normalized_sa))
-                pdf = self._pdf_modifier(_pdf_logits)
+            _pdf_logits = self._pdf_logits(self._pdf_mlp(normalized_sa))
+            pdf = self._get_pdf(_pdf_logits)
             return pdf
 
-        def _pdf_modifier(self, m):
+        def _get_pdf(self, m):
             m = torch.clamp(m - self._logZ, min=-5., max=5.)
             return m.exp()
 
@@ -57,14 +52,14 @@ class SRPBuilder(network_builder.A2CBuilder):
             for p in self.parameters():
                 p.requires_grad = False
 
-        def _build_aux_critics(self, input_shape, mlp_input_shape, num_particles):
+        def _build_aux_critics(self, mlp_input_shape, num_particles):
             self.aux_critics = nn.ModuleList([
-                self._build_aux_critic(input_shape=input_shape, mlp_input_shape=mlp_input_shape) for _ in range(num_particles)
+                self._build_aux_critic(mlp_input_shape=mlp_input_shape) for _ in range(num_particles)
             ])
-        
+
         def _build_pdf(self, ob_dim, ac_dim):            
             self._pdf_mlp = nn.Sequential()
-            
+
             mlp_args = {
                 'input_size' : ob_dim+ac_dim, 
                 'units' : self._pdf_units, 
@@ -88,16 +83,7 @@ class SRPBuilder(network_builder.A2CBuilder):
             torch.nn.init.zeros_(self._pdf_logits.bias) 
             return
 
-        def _build_aux_critic(self, input_shape, mlp_input_shape):
-            if self.has_cnn:
-                cnn_args = {
-                    'ctype' : self.cnn['type'], 
-                    'input_shape' : input_shape, 
-                    'convs' :self.cnn['convs'], 
-                    'activation' : self.cnn['activation'], 
-                    'norm_func_name' : self.normalization,
-                }
-                aux_critic_cnn = self._build_conv( **cnn_args)
+        def _build_aux_critic(self, mlp_input_shape):
 
             mlp_args = {
                 'input_size' : mlp_input_shape, 
@@ -116,7 +102,7 @@ class SRPBuilder(network_builder.A2CBuilder):
             aux_value = torch.nn.Linear(out_size, self.value_size)
             aux_value_act = self.activations_factory.create(self.value_activation)
             
-            aux_critic_network = nn.Sequential(*list(aux_critic_cnn), *list(aux_critic_mlp), aux_value, aux_value_act)
+            aux_critic_network = nn.Sequential(*list(aux_critic_mlp), aux_value, aux_value_act)
             mlp_init = self.init_factory.create(**self.initializer)
             for m in aux_critic_network.modules():
                 if isinstance(m, nn.Linear):
