@@ -14,6 +14,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
         for name, _ in net.named_parameters():
             print(name)
 
+        num_particles = config['num_particles']
         obs_shape = config['input_shape']
         actions_num = config['actions_num']
         normalize_value = config.get('normalize_value', False)
@@ -22,25 +23,32 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
         value_size = config.get('value_size', 1)
         
         return self.Network(net, normalize_pdf_input=normalize_pdf_input, actions_num=actions_num,
-                            obs_shape=obs_shape, normalize_value=normalize_value,
+                            num_particles=num_particles, obs_shape=obs_shape, normalize_value=normalize_value,
                             normalize_input=normalize_input, value_size=value_size)
 
     class Network(ModelA2CContinuousLogStd.Network):
-        def __init__(self, a2c_network, normalize_pdf_input, actions_num, **kwargs):
+        def __init__(self, a2c_network, normalize_pdf_input, actions_num, num_particles, **kwargs):
             super().__init__(a2c_network, **kwargs)
             obs_shape = kwargs['obs_shape']
             input_shape = obs_shape + actions_num
             self.normalize_pdf_input = normalize_pdf_input
+            self.num_particles = num_particles
             if normalize_pdf_input:
                 self.pdf_input_mean_std = RunningMeanStd((input_shape,))
             return
-        
+
         def forward(self, input_dict):
-            
-            
             is_train = input_dict.get('is_train', True)
+            obs = self.norm_obs(input_dict['obs'])
             result = super().forward(input_dict)
-        
+            if is_train:
+                aux_values = [self.a2c_network.aux_critics[i](obs) for i in range(self.num_particles)]
+            else:
+                aux_values = [self.unnorm_value(self.a2c_network.aux_critics[i](obs)) for i in range(self.num_particles)]
+            result['aux_values'] = aux_values
+            
+            return result
+
         def norm_sa(self, sa):
             with torch.no_grad():
                 return self.pdf_input_mean_std(sa) if self.normalize_pdf_input else sa

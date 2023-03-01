@@ -111,8 +111,6 @@ class SRPBuilder(network_builder.A2CBuilder):
                         torch.nn.init.zeros_(m.bias)
             return aux_critic_network
 
-
-
     def build(self, name, **kwargs):
         net = SRPBuilder.Network(self.params, **kwargs)
         return net
