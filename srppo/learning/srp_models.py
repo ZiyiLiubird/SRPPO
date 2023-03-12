@@ -8,7 +8,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
     def __init__(self, network):
         super().__init__(network)
         return
-    
+
     def build(self, config):
         net = self.network_builder.build('srp', **config)
         for name, _ in net.named_parameters():
@@ -21,7 +21,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
         normalize_input = config.get('normalize_input', False)
         normalize_pdf_input = config.get('normalized_pdf_input', False)
         value_size = config.get('value_size', 1)
-        
+
         return self.Network(net, normalize_pdf_input=normalize_pdf_input, actions_num=actions_num,
                             num_particles=num_particles, obs_shape=obs_shape, normalize_value=normalize_value,
                             normalize_input=normalize_input, value_size=value_size)
@@ -41,11 +41,13 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
             is_train = input_dict.get('is_train', True)
             obs = self.norm_obs(input_dict['obs'])
             result = super().forward(input_dict)
-            if is_train:
-                aux_values = [self.a2c_network.aux_critics[i](obs) for i in range(self.num_particles)]
-            else:
-                aux_values = [self.unnorm_value(self.a2c_network.aux_critics[i](obs)) for i in range(self.num_particles)]
-            result['aux_values'] = aux_values
+            stein_phase = input_dict['stein_phase']
+            if stein_phase:
+                if is_train:
+                    aux_values = [self.a2c_network.aux_critics[i](obs) for i in range(self.num_particles)]
+                else:
+                    aux_values = [self.unnorm_value(self.a2c_network.aux_critics[i](obs)) for i in range(self.num_particles)]
+                result['aux_values'] = aux_values
             
             return result
 
