@@ -1,5 +1,6 @@
 from rl_games.algos_torch import a2c_continuous
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
+from rl_games.algos_torch.moving_mean_std import MovingMeanStd
 from rl_games.algos_torch import torch_ext
 from rl_games.common import a2c_common
 from rl_games.common import schedulers
@@ -24,6 +25,9 @@ from tensorboardX import SummaryWriter
 
 from srppo.learning.batch_fifo_pdf import BatchFIFO
 from srppo.learning.particle import Particle
+
+EPS = 1e-5
+DR_MIN, DR_MAX = 0.05, 10.0
 
 
 class SRPAgent(a2c_continuous.A2CAgent):
@@ -52,6 +56,14 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
         self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
 
+        if self.normalize_value:
+            self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
+            self.aux_value_mean_std = self.model.aux_value_mean_std
+        
+        if self.normalize_advantage and self.normalize_rms_advantage:
+            momentum = self.config.get('adv_rms_momentum', 0.5) #'0.25'
+            self.aux_advantage_mean_std = [MovingMeanStd((1,), momentum=momentum).to(self.ppo_device) for i in range(self.num_particles)]
+
     def init_tensors(self):
         super().init_tensors()
         self._build_srp_buffers()
@@ -65,6 +77,20 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self.actions_low = torch.from_numpy(action_space.low.copy()).float().to(self.ppo_device)
         self.actions_high = torch.from_numpy(action_space.high.copy()).float().to(self.ppo_device)
         return
+
+    def set_eval(self):
+        self.model.eval()
+        if self.normalize_rms_advantage:
+            self.advantage_mean_std.eval()
+            for i in range(self.num_particles):
+                self.aux_advantage_mean_std[i].eval()
+
+    def set_train(self):
+        self.model.train()
+        if self.normalize_rms_advantage:
+            self.advantage_mean_std.train()
+            for i in range(self.num_particles):
+                self.aux_advantage_mean_std[i].train()
 
     def _build_srp_buffers(self):
         batch_shape = self.experience_buffer.obs_base_shape
@@ -84,12 +110,22 @@ class SRPAgent(a2c_continuous.A2CAgent):
         state = super().get_stats_weights()
         if self._normalize_pdf_input:
             state['pdf_input_mean_std'] = self.model.pdf_input_mean_std.state_dict()
+        if self.normalize_value:
+            state['aux_value_mean_std'] = [self.model.aux_value_mean_std[i].state_dict() for i in range(self.num_particles)]
+        if self.normalize_rms_advantage:
+            state['aux_advantage_mean_std'] = [self.aux_advantage_mean_std[i].state_dict() for i in range(self.num_particles)]
         return state
 
     def set_stats_weights(self, weights):
         super().set_stats_weights(weights)
         if self._normalize_pdf_input:
             self.model.pdf_input_mean_std.load_state_dict(weights['pdf_input_mean_std'])
+        if self.normalize_value:
+            for i in range(self.num_particles):
+                self.model.aux_value_mean_std[i].load_state_dict(weights['aux_value_mean_std'][i])
+        if self.normalize_rms_advantage:
+            for i in range(self.num_particles):
+                self.aux_advantage_mean_std[i].load_state_dict(weights['aux_advantage_mean_std'][i])
         return
 
     def prepare_dataset(self, batch_dict):
@@ -159,21 +195,35 @@ class SRPAgent(a2c_continuous.A2CAgent):
         mb_rewards = self.experience_buffer.tensor_dict['rewards']
         mb_advs = self.discount_values(fdones, last_values, mb_fdones, mb_values, mb_rewards)
         mb_returns = mb_advs + mb_values
-        
-        if self.stein_phase:
-            ## calculate aux_critic advantages and returns.
-            mb_obses = self.experience_buffer.tensor_dict['obses']
-            mb_actions = self.experience_buffer.tensor_dict['actions']
-            last_aux_values = last_values_dict['aux_values']
-            aux_mb_values = self.experience_buffer.tensor_dict['aux_values']
-            self._calc_stein_force_rewards()
-
-            
 
         batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
         batch_dict['played_frames'] = self.batch_size
         batch_dict['step_time'] = step_time
+
+        mb_obses = self.experience_buffer.tensor_dict['obses']
+        mb_actions = self.experience_buffer.tensor_dict['actions']
+        # TODO
+        self.current_trajs_buffer.add(mb_obses, mb_actions)
+
+        if self.stein_phase:
+            ## calculate aux_critic advantages and returns.
+            last_aux_values = last_values_dict['aux_values']
+            aux_nb_values = self.experience_buffer.tensor_dict['aux_values']
+            self._calc_stein_force_rewards(mb_obses, mb_actions)
+            aux_nb_rewards = self.experience_buffer.tensor_dict['aux_rewards']
+            aux_nb_returns = []
+            for i in range(self.num_particles):
+                nb_advs = self.discount_values(fdones, last_aux_values[i],
+                                               mb_fdones, aux_nb_values[i],
+                                               aux_nb_rewards[i])
+                nb_returns = nb_advs + aux_nb_values[i]
+                nb_returns = a2c_common.swap_and_flatten01(nb_returns)
+                aux_nb_returns.append(nb_returns)
+
+            batch_dict['aux_returns'] = aux_nb_returns
+        else:
+            batch_dict['aux_returns'] = None
 
         return batch_dict
 
@@ -185,6 +235,20 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 batch_dict = self.play_steps_rnn()
             else:
                 batch_dict = self.play_steps() 
+
+        if self.epoch_num % self.particle_update_interval == 0:
+            num_effect_particles = self.epoch_num // self.particle_update_interval - 1
+            if num_effect_particles < self.num_particles:
+                index = num_effect_particles
+                self.past_particles[index].update_model(self.model)
+                self.past_particles[index].update_traj_buffer(self.current_trajs_buffer)
+            else:
+                index = num_effect_particles % self.num_particles
+                self.past_particles[index].update_model(self.model)
+                self.past_particles[index].update_traj_buffer(self.current_trajs_buffer)
+                print('Add particle')
+                print('iteration ', self.epoch_num)
+                print('---------------------------------------------')
 
         self.set_train()
 
@@ -224,8 +288,6 @@ class SRPAgent(a2c_continuous.A2CAgent):
             if self.normalize_input:
                 self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
 
-        if self.epoch_num % self.particle_update_interval == 0:
-            pass
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
@@ -290,32 +352,20 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
     def get_values(self, obs):
         with torch.no_grad():
-            if self.has_central_value:
-                states = obs['states']
-                self.central_value_net.eval()
-                input_dict = {
-                    'is_train': False,
-                    'states' : states,
-                    'actions' : None,
-                    'is_done': self.dones,
-                    'stein_phase': self.stein_phase,
-                }
-                value = self.get_central_value(input_dict)
-            else:
-                self.model.eval()
-                processed_obs = self._preproc_obs(obs['obs'])
-                input_dict = {
-                    'is_train': False,
-                    'prev_actions': None, 
-                    'obs' : processed_obs,
-                    'rnn_states' : self.rnn_states,
-                    'stein_phase': self.stein_phase,
-                }
-                result = self.model(input_dict)
-                values = {
-                    'value': result['values']
-                }
-                values['aux_values'] = result['aux_values'] if self.stein_phase else None                
+            self.model.eval()
+            processed_obs = self._preproc_obs(obs['obs'])
+            input_dict = {
+                'is_train': False,
+                'prev_actions': None, 
+                'obs' : processed_obs,
+                'rnn_states' : self.rnn_states,
+                'stein_phase': self.stein_phase,
+            }
+            result = self.model(input_dict)
+            values = {
+                'value': result['values']
+            }
+            values['aux_values'] = result['aux_values'] if self.stein_phase else None                
             return values
 
     def _calc_stein_force_rewards(self, mb_obses, mb_actions):
@@ -323,12 +373,28 @@ class SRPAgent(a2c_continuous.A2CAgent):
             'obs': mb_obses,
             'actions': mb_actions
         }
-        m_pdfs = self.model.infer_pdf(input_dict, detach=True)
+        m_pdf = self.model.infer_pdf(input_dict, detach=True)
+        horizon_length = mb_obses.shape[0]
         for i in range(self.num_particles):
-            pass
+            n_pdf = self.past_particles[i].model.infer_pdf(input_dict, detach=True)
+            if self._divergence == "js":
+                ratio = self._dr(m_pdf, n_pdf)
+                rewards = -torch.log(1. / (1. + ratio) + EPS)
+            elif self._divergence == "kls":
+                ratio = self._dr(n_pdf, m_pdf)
+                rewards = -ratio - torch.log(ratio + EPS)
+            else:
+                raise ValueError("Unknown divergence")
+
+            rewards = rewards.view(horizon_length, -1, 1)
+            self.experience_buffer.tensor_dict['aux_rewards'][i].copy_(rewards)
 
     def calc_gradients(self, input_dict):
         self.set_train()
+        
+
+    def _dr(numer, denom):
+        return torch.div(numer, denom).clamp(min=DR_MIN, max=DR_MAX)
 
     def _load_config_params(self, config):
         
@@ -338,9 +404,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self._normalize_pdf_input = config.get('normalize_pdf_input', True)
         self.num_particles = config['num_particles']
         self._traj_buffer_capacity = config['traj_buffer_capacity']
-
         return
-
 
     def _build_net_config(self):
         obs_shape = torch_ext.shape_whc_to_cwh(self.obs_shape)

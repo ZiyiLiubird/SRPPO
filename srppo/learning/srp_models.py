@@ -35,6 +35,8 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
             self.num_particles = num_particles
             if normalize_pdf_input:
                 self.pdf_input_mean_std = RunningMeanStd((input_shape,))
+            if self.normalize_value:
+                self.aux_value_mean_std = [RunningMeanStd((self.value_size,)) for i in range(self.num_particles)]
             return
 
         def forward(self, input_dict):
@@ -46,10 +48,14 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
                 if is_train:
                     aux_values = [self.a2c_network.aux_critics[i](obs) for i in range(self.num_particles)]
                 else:
-                    aux_values = [self.unnorm_value(self.a2c_network.aux_critics[i](obs)) for i in range(self.num_particles)]
+                    aux_values = [self.unnorm_aux_value(self.a2c_network.aux_critics[i](obs), index=i) for i in range(self.num_particles)]
                 result['aux_values'] = aux_values
             
             return result
+
+        def unnorm_aux_value(self, aux_value, index):
+            with torch.no_grad():
+                return self.aux_value_mean_std[index](aux_value, unnorm=True) if self.normalize_value else aux_value
 
         def norm_sa(self, sa):
             with torch.no_grad():
