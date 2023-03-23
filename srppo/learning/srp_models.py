@@ -57,7 +57,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
         
         def infer_pdf(self, input_dict, detach=False):
             obs = input_dict['obs']
-            acts = input_dict['prev_actions']
+            acts = input_dict['actions']
             sa = torch.cat([obs, acts], dim=-1)
             normalized_sa = self.norm_sa(sa)
             if detach:

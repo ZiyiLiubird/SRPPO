@@ -44,6 +44,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self.states = None
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
+
         self.burnin_epoch = config['burnin_epoch']
         self.burnin_epoch_num = 0
         self.stein_phase = False
@@ -69,10 +70,10 @@ class SRPAgent(a2c_continuous.A2CAgent):
         batch_shape = self.experience_buffer.obs_base_shape
         val_space = gym.spaces.Box(low=0, high=1,shape=(self.value_size,))
         past_particle_space = gym.spaces.Box(low=0, high=1,shape=(self.num_particles,))
-        self.experience_buffer.tensor_dict['aux_rewards'] = torch.zeros(past_particle_space.shape+batch_shape + val_space.shape,
-                                                                        device=self.ppo_device)
-        self.experience_buffer.tensor_dict['aux_values'] = torch.zeros(past_particle_space.shape+batch_shape + val_space.shape,
-                                                                       device=self.ppo_device)
+        self.experience_buffer.tensor_dict['aux_rewards'] = torch.zeros(past_particle_space.shape + batch_shape + val_space.shape,
+                                                                        dtype=torch.float32, device=self.ppo_device)
+        self.experience_buffer.tensor_dict['aux_values'] = torch.zeros(past_particle_space.shape + batch_shape + val_space.shape,
+                                                                       dtype=torch.float32, device=self.ppo_device)
 
         self.current_trajs_buffer = BatchFIFO(capacity=self._traj_buffer_capacity)
         self.past_particles = {}
@@ -101,6 +102,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
     def play_steps(self):        
         update_list = self.update_list
+
         step_time = 0.0
 
         for n in range(self.horizon_length):
@@ -109,6 +111,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 res_dict = self.get_masked_action_values(self.obs, masks)
             else:
                 res_dict = self.get_action_values(self.obs) # contain aux_values
+
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
             
@@ -128,11 +131,11 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 shaped_rewards += self.gamma * res_dict['values'] * self.cast_obs(infos['time_outs']).unsqueeze(1).float()
 
             self.experience_buffer.update_data('rewards', n, shaped_rewards)
-            
+
             if self.stein_phase:
                 for idx, aux_value in enumerate(res_dict['aux_values']):
                     self.experience_buffer.tensor_dict['aux_values'][idx][n,:] = aux_value
-            
+
             self.current_rewards += rewards
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
@@ -158,11 +161,14 @@ class SRPAgent(a2c_continuous.A2CAgent):
         mb_returns = mb_advs + mb_values
         
         if self.stein_phase:
+            ## calculate aux_critic advantages and returns.
+            mb_obses = self.experience_buffer.tensor_dict['obses']
+            mb_actions = self.experience_buffer.tensor_dict['actions']
             last_aux_values = last_values_dict['aux_values']
             aux_mb_values = self.experience_buffer.tensor_dict['aux_values']
+            self._calc_stein_force_rewards()
+
             
-            
-            pass
 
         batch_dict = self.experience_buffer.get_transformed_list(a2c_common.swap_and_flatten01, self.tensor_list)
         batch_dict['returns'] = a2c_common.swap_and_flatten01(mb_returns)
@@ -179,16 +185,54 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 batch_dict = self.play_steps_rnn()
             else:
                 batch_dict = self.play_steps() 
-        
+
+        self.set_train()
+
         play_time_end = time.time()
         update_time_start = time.time()
         rnn_masks = batch_dict.get('rnn_masks', None)
-        
+
+        self.curr_frames = batch_dict.pop('played_frames')
+        self.prepare_dataset(batch_dict)
+        self.algo_observer.after_steps()
+
+        a_losses = []
+        c_losses = []
+        entropies = []
+        kls = []
+        if self.has_central_value:
+            self.train_central_value()
+
+        for mini_ep in range(0, self.mini_epochs_num):
+            ep_kls = []
+            for i in range(len(self.dataset)):
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul = self.train_actor_critic(self.dataset[i])
+                a_losses.append(a_loss)
+                c_losses.append(c_loss)
+                ep_kls.append(kl)
+                entropies.append(entropy)
+
+            av_kls = torch_ext.mean_list(ep_kls)
+            if self.multi_gpu:
+                dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
+                av_kls /= self.rank_size
+
+            self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+            self.update_lr(self.last_lr)
+            kls.append(av_kls)
+            self.diagnostics.mini_epoch(self, mini_ep)
+            if self.normalize_input:
+                self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
+
         if self.epoch_num % self.particle_update_interval == 0:
             pass
-        
-        
-        
+
+        update_time_end = time.time()
+        play_time = play_time_end - play_time_start
+        update_time = update_time_end - update_time_start
+        total_time = update_time_end - play_time_start
+
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul
 
     def update_epoch(self):
         if not self.stein_phase:
@@ -274,8 +318,14 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 values['aux_values'] = result['aux_values'] if self.stein_phase else None                
             return values
 
-    def compute_stein_force_reward(self):
-        pass
+    def _calc_stein_force_rewards(self, mb_obses, mb_actions):
+        input_dict = {
+            'obs': mb_obses,
+            'actions': mb_actions
+        }
+        m_pdfs = self.model.infer_pdf(input_dict, detach=True)
+        for i in range(self.num_particles):
+            pass
 
     def calc_gradients(self, input_dict):
         self.set_train()

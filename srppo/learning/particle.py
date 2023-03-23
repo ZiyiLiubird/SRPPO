@@ -14,4 +14,6 @@ class Particle:
             self.has_model = True
 
     def update_traj_buffer(self, traj_buffer):
+        # TODO
+        # add diversity.
         self.traj_buffer = copy.deepcopy(traj_buffer)
