@@ -2,6 +2,7 @@ from rl_games.algos_torch import a2c_continuous
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from rl_games.algos_torch.moving_mean_std import MovingMeanStd
 from rl_games.algos_torch import torch_ext
+from rl_games.common import common_losses
 from rl_games.common import a2c_common
 from rl_games.common import schedulers
 from rl_games.common import vecenv
@@ -15,6 +16,7 @@ from torch import optim
 import torch 
 from torch import nn
 import torch.distributed as dist
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 import gym
 
@@ -45,6 +47,15 @@ class SRPAgent(a2c_continuous.A2CAgent):
         net_config = self._build_net_config()
         self.model = self.network.build(net_config)
         self.model.to(self.ppo_device)
+
+        for n, p in self.model.named_parameters():
+            if n.__contains__('actor') or n.__contains__('sigma') or n.__contains__('mu'):
+                self.actor_params.append(p)
+            elif n.__contains__('critic') or n.__contains__('value'):
+                self.critic_params.append(p)
+            else:
+                self.pdf_params.append(p)
+
         self.states = None
         self.init_rnn_from_model(self.model)
         self.last_lr = float(self.last_lr)
@@ -53,16 +64,22 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self.burnin_epoch_num = 0
         self.stein_phase = False
         self.particle_update_interval = config['particle_update_interval']
+        self.normalize_aux_advantage = config['normalize_aux_advantage']
+        self.normalize_aux_rms_advantage = config.get('normalize_aux_rms_advantage', False)
 
-        self.optimizer = optim.Adam(self.model.parameters(), float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.actor_optimizer = optim.Adam(self.actor_params, float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.critic_optimizer = optim.Adam(self.critic_params, float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
+        self.pdf_optimizer = optim.Adam(self.pdf_params, float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
 
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
             self.aux_value_mean_std = self.model.aux_value_mean_std
         
-        if self.normalize_advantage and self.normalize_rms_advantage:
+        if self.normalize_aux_advantage and self.normalize_aux_rms_advantage:
             momentum = self.config.get('adv_rms_momentum', 0.5) #'0.25'
             self.aux_advantage_mean_std = [MovingMeanStd((1,), momentum=momentum).to(self.ppo_device) for i in range(self.num_particles)]
+
+        self.algo_observer.after_init(self)
 
     def init_tensors(self):
         super().init_tensors()
@@ -130,6 +147,34 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
     def prepare_dataset(self, batch_dict):
         super().prepare_dataset(batch_dict)
+
+        if self.stein_phase:
+            aux_returns = batch_dict['aux_returns']
+            aux_values = batch_dict['aux_values']
+
+            aux_advantages = aux_returns - aux_values
+
+            if self.normalize_value:
+                for i in range(self.num_particles):
+                    self.aux_value_mean_std[i].train()
+                    aux_values[i] = self.aux_value_mean_std[i](aux_values[i])
+                    aux_returns[i] = self.aux_value_mean_std[i](aux_returns[i])
+                    self.aux_value_mean_std[i].eval()
+            
+            for i in range(self.num_particles):
+                aux_advantages[i] = torch.sum(aux_advantages[i], axis=1)
+
+            if self.normalize_aux_advantage:
+                if self.normalize_aux_rms_advantage:
+                    for i in range(self.num_particles):
+                        aux_advantages[i] = self.aux_advantage_mean_std(aux_advantages[i])
+                else:
+                    for i in range(self.num_particles):
+                        aux_advantages[i] = (aux_advantages[i] - aux_advantages[i].mean()) / (aux_advantages[i].std() + 1e-8)
+
+            self.dataset.values_dict['old_aux_values'] = aux_values
+            self.dataset.values_dict['aux_advantages'] = aux_advantages
+            self.dataset.values_dict['aux_returns'] = aux_returns
 
         # store past particles trajs
         for i in range(self.num_particles):
@@ -221,9 +266,8 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 nb_returns = a2c_common.swap_and_flatten01(nb_returns)
                 aux_nb_returns.append(nb_returns)
 
-            batch_dict['aux_returns'] = aux_nb_returns
-        else:
-            batch_dict['aux_returns'] = None
+            batch_dict['aux_returns'] = torch.stack(aux_nb_returns, axis=0)
+            batch_dict['aux_values'] = aux_nb_values
 
         return batch_dict
 
@@ -262,39 +306,50 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
         a_losses = []
         c_losses = []
+        b_losses = []
         entropies = []
         kls = []
-        if self.has_central_value:
-            self.train_central_value()
+        train_info = None
 
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul = self.train_actor_critic(self.dataset[i])
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 ep_kls.append(kl)
                 entropies.append(entropy)
+                if self.bounds_loss_coef is not None:
+                    b_losses.append(b_loss)
+
+                self.dataset.update_mu_sigma(cmu, csigma)
+                if self.schedule_type == 'legacy':
+                    av_kls = kl
+                    if self.multi_gpu:
+                        dist.all_reduce(kl, op=dist.ReduceOp.SUM)
+                        av_kls /= self.rank_size
+                    self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+                    self.update_lr(self.last_lr)
 
             av_kls = torch_ext.mean_list(ep_kls)
             if self.multi_gpu:
                 dist.all_reduce(av_kls, op=dist.ReduceOp.SUM)
                 av_kls /= self.rank_size
+            if self.schedule_type == 'standard':
+                self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+                self.update_lr(self.last_lr)
 
-            self.last_lr, self.entropy_coef = self.scheduler.update(self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-            self.update_lr(self.last_lr)
             kls.append(av_kls)
             self.diagnostics.mini_epoch(self, mini_ep)
             if self.normalize_input:
                 self.model.running_mean_std.eval() # don't need to update statstics more than one miniepoch
-
 
         update_time_end = time.time()
         play_time = play_time_end - play_time_start
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
 
-        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, entropies, kls, last_lr, lr_mul
+        return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
 
     def update_epoch(self):
         if not self.stein_phase:
@@ -390,11 +445,134 @@ class SRPAgent(a2c_continuous.A2CAgent):
             self.experience_buffer.tensor_dict['aux_rewards'][i].copy_(rewards)
 
     def calc_gradients(self, input_dict):
-        self.set_train()
-        
+        # self.set_train()
+        value_preds_batch = input_dict['old_values']
+        old_action_log_probs_batch = input_dict['old_logp_actions']
+        advantage = input_dict['advantages']
+        old_mu_batch = input_dict['mu']
+        old_sigma_batch = input_dict['sigma']
+        return_batch = input_dict['returns']
+        actions_batch = input_dict['actions']
+        obs_batch = input_dict['obs']
+        obs_batch = self._preproc_obs(obs_batch)
+
+        if self.stein_phase:
+            aux_value_preds_batch = input_dict['old_aux_values']
+            aux_advantages = input_dict['aux_advantages']
+            aux_return_batch = input_dict['aux_returns']
+
+        lr_mul = 1.0
+        curr_e_clip = self.e_clip
+
+        batch_dict = {
+            'is_train': True,
+            'prev_actions': actions_batch, 
+            'obs' : obs_batch,
+            'stein_phase': self.stein_phase,
+        }
+
+        rnn_masks = None
+        if self.is_rnn:
+            rnn_masks = input_dict['rnn_masks']
+            batch_dict['rnn_states'] = input_dict['rnn_states']
+            batch_dict['seq_length'] = self.seq_len
+
+            if self.zero_rnn_on_done:
+                batch_dict['dones'] = input_dict['dones']            
+
+        with torch.cuda.amp.autocast(enabled=self.mixed_precision):
+            res_dict = self.model(batch_dict)
+            action_log_probs = res_dict['prev_neglogp']
+            values = res_dict['values']
+            entropy = res_dict['entropy']
+            mu = res_dict['mus']
+            sigma = res_dict['sigmas']
+
+            if self.stein_phase:
+                aux_values = res_dict['aux_values']
+
+            a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
+
+            if self.has_value_loss:
+                c_loss = common_losses.critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+            else:
+                c_loss = torch.zeros(1, device=self.ppo_device)
+            if self.bound_loss_type == 'regularisation':
+                b_loss = self.reg_loss(mu)
+            elif self.bound_loss_type == 'bound':
+                b_loss = self.bound_loss(mu)
+            else:
+                b_loss = torch.zeros(1, device=self.ppo_device)
+            losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
+            a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
+
+            # loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            actor_loss = a_loss - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
+            critic_loss = 0.5 * c_loss * self.critic_coef
+            pdf_loss = None
+            
+            if self.multi_gpu:
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                self.pdf_optimizer.zero_grad()
+            else:
+                for param in self.model.parameters():
+                    param.grad = None
+
+        self.scaler.scale(actor_loss).backward()
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.scale(pdf_loss).backward()
+        #TODO: Refactor this ugliest code of they year
+        self.trancate_gradients_and_step(identity='actor')
+        self.trancate_gradients_and_step(identity='critic')
+        self.trancate_gradients_and_step(identity='pdf')
+
+        with torch.no_grad():
+            reduce_kl = rnn_masks is None
+            kl_dist = torch_ext.policy_kl(mu.detach(), sigma.detach(), old_mu_batch, old_sigma_batch, reduce_kl)
+            if rnn_masks is not None:
+                kl_dist = (kl_dist * rnn_masks).sum() / rnn_masks.numel()  #/ sum_mask
+
+        self.diagnostics.mini_batch(self,
+        {
+            'values' : value_preds_batch,
+            'returns' : return_batch,
+            'new_neglogp' : action_log_probs,
+            'old_neglogp' : old_action_log_probs_batch,
+            'masks' : rnn_masks
+        }, curr_e_clip, 0)      
+
+        self.train_result = (a_loss, c_loss, entropy, \
+            kl_dist, self.last_lr, lr_mul, \
+            mu.detach(), sigma.detach(), b_loss)
 
     def _dr(numer, denom):
         return torch.div(numer, denom).clamp(min=DR_MIN, max=DR_MAX)
+
+    def trancate_gradients_and_step(self, identity):
+        if self.truncate_grads:
+            if identity == 'actor':
+                self.scaler.unscale_(self.actor_optimizer)
+                nn.utils.clip_grad_norm_(self.actor_params, self.grad_norm)
+            elif identity == 'critic':
+                self.scaler.unscale_(self.critic_optimizer)
+                nn.utils.clip_grad_norm_(self.critic_params, self.grad_norm)
+            elif identity == 'pdf':
+                self.scaler.unscale_(self.pdf_optimizer)
+                nn.utils.clip_grad_norm_(self.pdf_params, self.grad_norm)
+            else:
+                raise NotImplementedError
+
+        if identity == 'actor':
+            self.scaler.step(self.actor_optimizer)
+        elif identity == 'critic':
+            self.scaler.step(self.critic_optimizer)
+        elif identity == 'pdf':
+            self.scaler.step(self.pdf_optimizer)
+        else:
+            raise NotImplementedError
+
+        self.scaler.update()
 
     def _load_config_params(self, config):
         
@@ -419,6 +597,59 @@ class SRPAgent(a2c_continuous.A2CAgent):
             'num_particles': self.num_particles
         }
         return config
+
+    def update_lr(self, lr):
+        if self.multi_gpu:
+            lr_tensor = torch.tensor([lr], device=self.device)
+            dist.broadcast(lr_tensor, 0)
+            lr = lr_tensor.item()
+
+        for param_group in self.actor_optimizer.param_groups:
+            param_group['lr'] = lr
+        for param_group in self.critic_optimizer.param_groups:
+            param_group['lr'] = lr
+        for param_group in self.pdf_optimizer.param_groups:
+            param_group['lr'] = lr
+        if self.has_central_value:
+           self.central_value_net.update_lr(lr)
+
+    def get_full_state_weights(self):
+        state = self.get_weights()
+        state['epoch'] = self.epoch_num
+        state['actor_optimizer'] = self.actor_optimizer.state_dict()
+        state['critic_optimizer'] = self.critic_optimizer.state_dict()
+        state['pdf_optimizer'] = self.pdf_optimizer.state_dict()
+        if self.has_central_value:
+            state['assymetric_vf_nets'] = self.central_value_net.state_dict()
+        state['frame'] = self.frame
+
+        # This is actually the best reward ever achieved. last_mean_rewards is perhaps not the best variable name
+        # We save it to the checkpoint to prevent overriding the "best ever" checkpoint upon experiment restart
+        state['last_mean_rewards'] = self.last_mean_rewards
+
+        if self.vec_env is not None:
+            env_state = self.vec_env.get_env_state()
+            state['env_state'] = env_state
+
+        return state
+
+    def set_full_state_weights(self, weights):
+        self.set_weights(weights)
+        self.epoch_num = weights['epoch'] # frames as well?
+        if self.has_central_value:
+            self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
+
+        self.actor_optimizer.load_state_dict(weights['actor_optimizer'])
+        self.critic_optimizer.load_state_dict(weights['critic_optimizer'])
+        self.pdf_optimizer.load_state_dict(weights['pdf_optimizer'])
+        
+        self.frame = weights.get('frame', 0)
+        self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
+
+        env_state = weights.get('env_state', None)
+
+        if self.vec_env is not None:
+            self.vec_env.set_env_state(env_state)
 
     def _log_train_info(self, train_info, frame):
         super()._log_train_info(train_info, frame)

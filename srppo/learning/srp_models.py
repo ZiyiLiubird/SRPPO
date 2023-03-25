@@ -50,7 +50,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
                 else:
                     aux_values = [self.unnorm_aux_value(self.a2c_network.aux_critics[i](obs), index=i) for i in range(self.num_particles)]
                 result['aux_values'] = aux_values
-            
+
             return result
 
         def unnorm_aux_value(self, aux_value, index):

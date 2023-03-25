@@ -80,7 +80,7 @@ class SRPBuilder(network_builder.A2CBuilder):
                         torch.nn.init.zeros_(m.bias)
             
             torch.nn.init.uniform_(self._pdf_logits.weight, -PDF_LOGIT_INIT_SCALE, PDF_LOGIT_INIT_SCALE)
-            torch.nn.init.zeros_(self._pdf_logits.bias) 
+            # torch.nn.init.zeros_(self._pdf_logits.bias) 
             return
 
         def _build_aux_critic(self, mlp_input_shape):
