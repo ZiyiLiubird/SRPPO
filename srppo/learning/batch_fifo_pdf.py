@@ -6,10 +6,9 @@ import torch
 
 class BatchFIFO:
 
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.num_batches = 0
-        self.buffer_ = deque()
+    def __init__(self, obses_shape, act_shape, device):
+        self.obses = torch.zeros(obses_shape, dtype=torch.float32, device=device)
+        self.actions = torch.zeros(act_shape, dtype=torch.float32, device=device)
 
     def get_sample(self, nbatches):
         if self.num_batches < nbatches:
@@ -33,16 +32,8 @@ class BatchFIFO:
         return self.capacity
 
     def add(self, obs, acs):
-        batch = dict(obs=deepcopy(obs), acs=deepcopy(acs))
-        if self.num_batches < self.capacity:
-            self.buffer_.append(batch)
-            self.num_batches += 1
-        else:
-            self.buffer_.popleft()
-            self.buffer_.append(batch)
-
-    def count(self):
-        return self.num_batches
+        self.obses = deepcopy(obs)
+        self.acs = deepcopy(acs)
 
     def erase(self):
         self.buffer_ = deque()

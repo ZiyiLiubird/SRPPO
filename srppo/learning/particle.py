@@ -5,6 +5,11 @@ class Particle:
     def __init__(self, index) -> None:
         self.index = index
         self.has_model = False
+        self.has_traj = False
+        self.grad_current_policy = dict()
+
+    def update_gradients(self, index, grads):
+        self.grad_current_policy[index] = grads
 
     def update_model(self, model:nn.Module):
         if self.has_model:
@@ -13,7 +18,13 @@ class Particle:
             self.model = copy.deepcopy(model)
             self.has_model = True
 
-    def update_traj_buffer(self, traj_buffer):
+    def update_traj(self, obs, acs):
         # TODO
         # add diversity.
-        self.traj_buffer = copy.deepcopy(traj_buffer)
+        if self.has_traj:
+            self.obses[:] = obs[:]
+            self.acs[:] = acs[:]
+        else:
+            self.obses = copy.deepcopy(obs)
+            self.acs = copy.deepcopy(acs)
+            self.has_traj = True

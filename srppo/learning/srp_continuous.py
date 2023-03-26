@@ -48,6 +48,10 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self.model = self.network.build(net_config)
         self.model.to(self.ppo_device)
 
+        self.actor_params = []
+        self.critic_params = []
+        self.pdf_params = []
+
         for n, p in self.model.named_parameters():
             if n.__contains__('actor') or n.__contains__('sigma') or n.__contains__('mu'):
                 self.actor_params.append(p)
@@ -55,6 +59,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
                 self.critic_params.append(p)
             else:
                 self.pdf_params.append(p)
+        self.actor_pcnt = sum(p.numel() for p in self.actor_params if p.requires_grad)
 
         self.states = None
         self.init_rnn_from_model(self.model)
@@ -117,8 +122,9 @@ class SRPAgent(a2c_continuous.A2CAgent):
                                                                         dtype=torch.float32, device=self.ppo_device)
         self.experience_buffer.tensor_dict['aux_values'] = torch.zeros(past_particle_space.shape + batch_shape + val_space.shape,
                                                                        dtype=torch.float32, device=self.ppo_device)
-
-        self.current_trajs_buffer = BatchFIFO(capacity=self._traj_buffer_capacity)
+        obses_shape = self.experience_buffer.tensor_dict['obses'].shape
+        act_shape = self.experience_buffer.tensor_dict['actions'].shape
+        # self.current_trajs_buffer = BatchFIFO()
         self.past_particles = {}
         for i in range(self.num_particles):
             self.past_particles[i] = Particle(index=i)
@@ -160,7 +166,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
                     aux_values[i] = self.aux_value_mean_std[i](aux_values[i])
                     aux_returns[i] = self.aux_value_mean_std[i](aux_returns[i])
                     self.aux_value_mean_std[i].eval()
-            
+
             for i in range(self.num_particles):
                 aux_advantages[i] = torch.sum(aux_advantages[i], axis=1)
 
@@ -195,7 +201,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
             self.experience_buffer.update_data('obses', n, self.obs['obs'])
             self.experience_buffer.update_data('dones', n, self.dones)
-            
+
             for k in update_list:
                 self.experience_buffer.update_data(k, n, res_dict[k]) 
             if self.has_central_value:
@@ -221,7 +227,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
             self.current_lengths += 1
             all_done_indices = self.dones.nonzero(as_tuple=False)
             env_done_indices = all_done_indices[::self.num_agents]
-     
+
             self.game_rewards.update(self.current_rewards[env_done_indices])
             self.game_lengths.update(self.current_lengths[env_done_indices])
             self.algo_observer.process_infos(infos, env_done_indices)
@@ -248,8 +254,10 @@ class SRPAgent(a2c_continuous.A2CAgent):
 
         mb_obses = self.experience_buffer.tensor_dict['obses']
         mb_actions = self.experience_buffer.tensor_dict['actions']
-        # TODO
-        self.current_trajs_buffer.add(mb_obses, mb_actions)
+
+        if self.update_particle:
+            self.past_particles[self.current_index].update_traj(obs=batch_dict['obses'],
+                                                                acs=batch_dict['actions'])
 
         if self.stein_phase:
             ## calculate aux_critic advantages and returns.
@@ -274,25 +282,25 @@ class SRPAgent(a2c_continuous.A2CAgent):
     def train_epoch(self):
         self.set_eval()
         play_time_start = time.time()
+
+        self.update_particle = False
+        if self.epoch_num % self.particle_update_interval == 0:
+            self.update_particle = True
+
+        if self.update_particle:
+            num_effect_particles = self.epoch_num // self.particle_update_interval - 1
+            if num_effect_particles < self.num_particles:
+                self.current_index = num_effect_particles
+                self.past_particles[self.current_index].update_model(self.model)
+            else:
+                self.current_index = num_effect_particles % self.num_particles
+                self.past_particles[self.current_index].update_model(self.model)
+
         with torch.no_grad():
             if self.is_rnn:
                 batch_dict = self.play_steps_rnn()
             else:
-                batch_dict = self.play_steps() 
-
-        if self.epoch_num % self.particle_update_interval == 0:
-            num_effect_particles = self.epoch_num // self.particle_update_interval - 1
-            if num_effect_particles < self.num_particles:
-                index = num_effect_particles
-                self.past_particles[index].update_model(self.model)
-                self.past_particles[index].update_traj_buffer(self.current_trajs_buffer)
-            else:
-                index = num_effect_particles % self.num_particles
-                self.past_particles[index].update_model(self.model)
-                self.past_particles[index].update_traj_buffer(self.current_trajs_buffer)
-                print('Add particle')
-                print('iteration ', self.epoch_num)
-                print('---------------------------------------------')
+                batch_dict = self.play_steps()
 
         self.set_train()
 
@@ -314,7 +322,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
-                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i])
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i], mini_ep, i)
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
                 ep_kls.append(kl)
@@ -358,7 +366,10 @@ class SRPAgent(a2c_continuous.A2CAgent):
             else:
                 self.burnin_epoch_num += 1
         return super().update_epoch()
-        
+
+    def train_actor_critic(self, input_dict, mini_epoch, cur_id):
+        self.calc_gradients(input_dict, mini_epoch, cur_id)
+        return self.train_result
 
     def train(self,):
         self.init_tensors()
@@ -444,8 +455,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
             rewards = rewards.view(horizon_length, -1, 1)
             self.experience_buffer.tensor_dict['aux_rewards'][i].copy_(rewards)
 
-    def calc_gradients(self, input_dict):
-        # self.set_train()
+    def calc_gradients(self, input_dict, mini_epoch, cur_id):
         value_preds_batch = input_dict['old_values']
         old_action_log_probs_batch = input_dict['old_logp_actions']
         advantage = input_dict['advantages']
@@ -491,37 +501,74 @@ class SRPAgent(a2c_continuous.A2CAgent):
             if self.stein_phase:
                 aux_values = res_dict['aux_values']
 
+            # calculate policy gradients.
             a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage, self.ppo, curr_e_clip)
 
-            if self.has_value_loss:
-                c_loss = common_losses.critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
-            else:
-                c_loss = torch.zeros(1, device=self.ppo_device)
             if self.bound_loss_type == 'regularisation':
                 b_loss = self.reg_loss(mu)
             elif self.bound_loss_type == 'bound':
                 b_loss = self.bound_loss(mu)
             else:
                 b_loss = torch.zeros(1, device=self.ppo_device)
+
+            if self.has_value_loss:
+                c_loss = common_losses.critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
+            else:
+                c_loss = torch.zeros(1, device=self.ppo_device)
+
             losses, sum_mask = torch_ext.apply_masks([a_loss.unsqueeze(1), c_loss , entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
-            # loss = a_loss + 0.5 * c_loss * self.critic_coef - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             actor_loss = a_loss - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
             critic_loss = 0.5 * c_loss * self.critic_coef
+            # TODO: this
             pdf_loss = None
-            
-            if self.multi_gpu:
-                self.actor_optimizer.zero_grad()
-                self.critic_optimizer.zero_grad()
-                self.pdf_optimizer.zero_grad()
-            else:
-                for param in self.model.parameters():
-                    param.grad = None
 
-        self.scaler.scale(actor_loss).backward()
-        self.scaler.scale(critic_loss).backward()
-        self.scaler.scale(pdf_loss).backward()
+            self.actor_optimizer.zero_grad()
+            self.critic_optimizer.zero_grad()
+            self.pdf_optimizer.zero_grad()
+
+
+            # calculate stein repulsive force
+            if self.stein_phase:
+                self.scaler.scale(actor_loss).backward(retain_graph=True)
+                grad_current_policy = parameters_to_vector((p.grad for p in self.actor_params)).detach()
+                assert grad_current_policy.size(0) == self.actor_pcnt
+                if self.update_particle and mini_epoch == 0:
+                    self.past_particles[self.current_index].update_gradients(index=cur_id, grads=grad_current_policy)
+                self.actor_optimizer.zero_grad()
+
+                grad_exploration = torch.zeros_like(grad_current_policy, device=self.ppo_device)
+                grad_exploitation = grad_current_policy.clone()
+
+                for i in range(self.num_particles):
+                    nb_a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, aux_advantages[i], self.ppo, curr_e_clip)
+                    nb_a_loss = nb_a_loss.mean()
+                    self.actor_optimizer.zero_grad()
+                    nb_a_loss.backward(retain_graph=(i!=self.num_particles-1))
+                    grad_stein_force = parameters_to_vector((p.grad for p in self.actor_params)).detach()
+                    self.actor_optimizer.zero_grad()
+                    grad_exploration += kernel_vals[i] * grad_stein_force
+
+                    grad_nb = self.past_particles[i].grad_current_policy[cur_id]
+                    assert grad_nb.size(0) == self.actor_pcnt
+                    grad_exploitation += kernel_vals[i] * grad_nb
+                
+                # gradient averaging
+                # TODO  
+                omega = anneal_coef if self.svpg_expl_wt is None else self.svpg_expl_wt
+                grad_avg = grad_exploration * omega + grad_exploitation * (1 - omega)
+                grad_avg /= (sum(kernel_vals.values()) + 1)
+
+            else:
+                self.scaler.scale(actor_loss).backward()
+                self.scaler.scale(critic_loss).backward()
+                self.scaler.scale(pdf_loss).backward()
+                grad_current_policy = parameters_to_vector((p.grad for p in self.actor_params)).detach()
+                if self.update_particle and mini_epoch == 0:
+                    self.past_particles[self.current_index].update_gradients(index=cur_id, grads=grad_current_policy)
+
+
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step(identity='actor')
         self.trancate_gradients_and_step(identity='critic')
@@ -581,7 +628,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self._temperature = config.get('temperature', 1.0)
         self._normalize_pdf_input = config.get('normalize_pdf_input', True)
         self.num_particles = config['num_particles']
-        self._traj_buffer_capacity = config['traj_buffer_capacity']
+        # self._traj_buffer_capacity = config['traj_buffer_capacity']
         return
 
     def _build_net_config(self):
@@ -642,7 +689,7 @@ class SRPAgent(a2c_continuous.A2CAgent):
         self.actor_optimizer.load_state_dict(weights['actor_optimizer'])
         self.critic_optimizer.load_state_dict(weights['critic_optimizer'])
         self.pdf_optimizer.load_state_dict(weights['pdf_optimizer'])
-        
+
         self.frame = weights.get('frame', 0)
         self.last_mean_rewards = weights.get('last_mean_rewards', -100500)
 
