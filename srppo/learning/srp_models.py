@@ -60,7 +60,7 @@ class ModelSRPContinuous(ModelA2CContinuousLogStd):
         def norm_sa(self, sa):
             with torch.no_grad():
                 return self.pdf_input_mean_std(sa) if self.normalize_pdf_input else sa
-        
+
         def infer_pdf(self, input_dict, detach=False):
             obs = input_dict['obs']
             acts = input_dict['actions']
