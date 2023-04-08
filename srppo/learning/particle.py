@@ -1,15 +1,16 @@
 import copy
+import torch
 import torch.nn as nn
 
 class Particle:
     def __init__(self, index) -> None:
         self.index = index
         self.has_model = False
-        self.has_traj = False
+        self.obs_actions = dict()
         self.grad_current_policy = dict()
 
-    def update_gradients(self, index, grads):
-        self.grad_current_policy[index] = grads
+    def update_gradients(self, index:int, grads:torch.Tensor):
+        self.grad_current_policy[index] = grads.clone()
 
     def update_model(self, model:nn.Module):
         if self.has_model:
@@ -18,13 +19,8 @@ class Particle:
             self.model = copy.deepcopy(model)
             self.has_model = True
 
-    def update_traj(self, obs, acs):
+    def update_traj(self, obs:torch.Tensor, acs:torch.Tensor):
         # TODO
         # add diversity.
-        if self.has_traj:
-            self.obses[:] = obs[:]
-            self.acs[:] = acs[:]
-        else:
-            self.obses = copy.deepcopy(obs)
-            self.acs = copy.deepcopy(acs)
-            self.has_traj = True
+        self.obs_actions['obses'] = obs.clone()
+        self.obs_actions['actions'] = acs.clone()

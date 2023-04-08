@@ -24,6 +24,7 @@ from srppo.learning.batch_fifo_pdf import BatchFIFO
 EPS = 1e-5
 DR_MIN, DR_MAX = 0.05, 10.0
 
+
 class CommonAgent(a2c_continuous.A2CAgent):
     def __init__(self, base_name, params):
         super().__init__(base_name, params)
@@ -53,13 +54,9 @@ class CommonAgent(a2c_continuous.A2CAgent):
             else:
                 self.pdf_params.append(p)
         self.actor_pcnt = sum(p.numel() for p in self.actor_params if p.requires_grad)
-        
-        self.burnin_epoch = config['burnin_epoch']
+
         self.burnin_epoch_num = 0
         self.stein_phase = False
-        self.particle_update_interval = config['particle_update_interval']
-        self.normalize_aux_advantage = config['normalize_aux_advantage']
-        self.normalize_aux_rms_advantage = config.get('normalize_aux_rms_advantage', False)
 
         self.actor_optimizer = optim.Adam(self.actor_params, float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
         self.critic_optimizer = optim.Adam(self.critic_params, float(self.last_lr), eps=1e-08, weight_decay=self.weight_decay)
@@ -68,7 +65,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
         if self.normalize_value:
             self.value_mean_std = self.central_value_net.model.value_mean_std if self.has_central_value else self.model.value_mean_std
             self.aux_value_mean_std = self.model.aux_value_mean_std
-        
+
         if self.normalize_aux_advantage and self.normalize_aux_rms_advantage:
             momentum = self.config.get('adv_rms_momentum', 0.5) #'0.25'
             self.aux_advantage_mean_std = [MovingMeanStd((1,), momentum=momentum).to(self.ppo_device) for i in range(self.num_particles)]
@@ -77,15 +74,17 @@ class CommonAgent(a2c_continuous.A2CAgent):
         self.model.eval()
         if self.normalize_rms_advantage:
             self.advantage_mean_std.eval()
-            for i in range(self.num_particles):
-                self.aux_advantage_mean_std[i].eval()
+            if self.normalize_aux_rms_advantage:
+                for i in range(self.num_particles):
+                    self.aux_advantage_mean_std[i].eval()
 
     def set_train(self):
         self.model.train()
         if self.normalize_rms_advantage:
             self.advantage_mean_std.train()
-            for i in range(self.num_particles):
-                self.aux_advantage_mean_std[i].train()
+            if self.normalize_aux_rms_advantage:
+                for i in range(self.num_particles):
+                    self.aux_advantage_mean_std[i].train()
 
     def get_stats_weights(self):
         state = super().get_stats_weights()
@@ -94,6 +93,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
         if self.normalize_value:
             state['aux_value_mean_std'] = [self.model.aux_value_mean_std[i].state_dict() for i in range(self.num_particles)]
         if self.normalize_rms_advantage:
+            state['advantage_mean_std'] = self.advantage_mean_std
+        if self.normalize_aux_rms_advantage:
             state['aux_advantage_mean_std'] = [self.aux_advantage_mean_std[i].state_dict() for i in range(self.num_particles)]
         return state
 
@@ -104,7 +105,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
         if self.normalize_value:
             for i in range(self.num_particles):
                 self.model.aux_value_mean_std[i].load_state_dict(weights['aux_value_mean_std'][i])
-        if self.normalize_rms_advantage:
+        if self.normalize_aux_rms_advantage:
             for i in range(self.num_particles):
                 self.aux_advantage_mean_std[i].load_state_dict(weights['aux_advantage_mean_std'][i])
         return
@@ -118,12 +119,12 @@ class CommonAgent(a2c_continuous.A2CAgent):
             self.update_particle = True
 
         if self.update_particle:
-            num_effect_particles = self.epoch_num // self.particle_update_interval - 1
-            if num_effect_particles < self.num_particles:
-                self.current_index = num_effect_particles
+            self.num_effect_particles = self.epoch_num // self.particle_update_interval - 1
+            if self.num_effect_particles < self.num_particles:
+                self.current_index = self.num_effect_particles
                 self.past_particles[self.current_index].update_model(self.model)
             else:
-                self.current_index = num_effect_particles % self.num_particles
+                self.current_index = self.num_effect_particles % self.num_particles
                 self.past_particles[self.current_index].update_model(self.model)
 
         with torch.no_grad():
@@ -152,6 +153,15 @@ class CommonAgent(a2c_continuous.A2CAgent):
         for mini_ep in range(0, self.mini_epochs_num):
             ep_kls = []
             for i in range(len(self.dataset)):
+                curr_train_info = self.train_actor_critic(self.dataset[i], mini_ep, i)
+                if (train_info is None):
+                    train_info = dict()
+                    for k, v in curr_train_info.items():
+                        train_info[k] = [v]
+                else:
+                    for k, v in curr_train_info.items():
+                        train_info[k].append(v)
+                    
                 a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = self.train_actor_critic(self.dataset[i], mini_ep, i)
                 a_losses.append(a_loss)
                 c_losses.append(c_loss)
@@ -190,16 +200,15 @@ class CommonAgent(a2c_continuous.A2CAgent):
         return batch_dict['step_time'], play_time, update_time, total_time, a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul
 
     def update_epoch(self):
+        super().update_epoch()
         if not self.stein_phase:
             if self.burnin_epoch_num > self.burnin_epoch:
                 self.stein_phase = True
             else:
                 self.burnin_epoch_num += 1
-        return super().update_epoch()
-
-    def train_actor_critic(self, input_dict, mini_epoch, cur_id):
-        self.calc_gradients(input_dict, mini_epoch, cur_id)
-        return self.train_result
+        else:
+            self.anneal_coef = 1 - float(self.epoch_num - self.burnin_epoch) / (self.max_epochs - self.burnin_epoch)
+        return self.epoch_num
 
     def train(self,):
         self.init_tensors()
@@ -216,7 +225,7 @@ class CommonAgent(a2c_continuous.A2CAgent):
             model_params = [self.model.state_dict()]
             dist.broadcast_object_list(model_params, 0)
             self.model.load_state_dict(model_params[0])
-        
+
         while True:
             epoch_num = self.update_epoch()
             train_info = self.train_epoch()
@@ -265,13 +274,15 @@ class CommonAgent(a2c_continuous.A2CAgent):
            self.central_value_net.update_lr(lr)
 
     def _load_config_params(self, config):
-        
         self._stein_repulsive_wt = config.get('stein_repulsive_wt', None)
         self._divergence = config.get('divergence', 'kls')
         self._temperature = config.get('temperature', 1.0)
         self._normalize_pdf_input = config.get('normalize_pdf_input', True)
         self.num_particles = config['num_particles']
-        # self._traj_buffer_capacity = config['traj_buffer_capacity']
+        self.burnin_epoch = config['burnin_epoch']
+        self.particle_update_interval = config['particle_update_interval']
+        self.normalize_aux_advantage = config['normalize_aux_advantage']
+        self.normalize_aux_rms_advantage = config.get('normalize_aux_rms_advantage', False)
         return
 
     def _setup_action_space(self):
@@ -300,6 +311,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
     def get_full_state_weights(self):
         state = self.get_weights()
         state['epoch'] = self.epoch_num
+        state['burnin_epoch_num'] = self.burnin_epoch_num
+        state['stein_phase'] = self.stein_phase
         state['actor_optimizer'] = self.actor_optimizer.state_dict()
         state['critic_optimizer'] = self.critic_optimizer.state_dict()
         state['pdf_optimizer'] = self.pdf_optimizer.state_dict()
@@ -320,6 +333,8 @@ class CommonAgent(a2c_continuous.A2CAgent):
     def set_full_state_weights(self, weights):
         self.set_weights(weights)
         self.epoch_num = weights['epoch'] # frames as well?
+        self.burnin_epoch_num = weights['burnin_epoch_num']
+        self.stein_phase = weights['stein_phase']
         if self.has_central_value:
             self.central_value_net.load_state_dict(weights['assymetric_vf_nets'])
 

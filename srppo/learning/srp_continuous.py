@@ -46,9 +46,6 @@ class SRPAgent(CommonAgent):
                                                                         dtype=torch.float32, device=self.ppo_device)
         self.experience_buffer.tensor_dict['aux_values'] = torch.zeros(past_particle_space.shape + batch_shape + val_space.shape,
                                                                        dtype=torch.float32, device=self.ppo_device)
-        obses_shape = self.experience_buffer.tensor_dict['obses'].shape
-        act_shape = self.experience_buffer.tensor_dict['actions'].shape
-        # self.current_trajs_buffer = BatchFIFO()
         self.past_particles = {}
         for i in range(self.num_particles):
             self.past_particles[i] = Particle(index=i)
@@ -84,9 +81,11 @@ class SRPAgent(CommonAgent):
             self.dataset.values_dict['aux_advantages'] = aux_advantages
             self.dataset.values_dict['aux_returns'] = aux_returns
 
-        # store past particles trajs
-        for i in range(self.num_particles):
-            self.dataset.values_dict[f'particle_{i}_sa'] = self.past_particles[i].traj_buffer.get_sample(nbatches=1)
+        if self.num_effect_particles > self.num_particles - 1:
+            # store past particles trajs
+            for i in range(self.num_particles):
+                self.dataset.values_dict[f'particle_{i}_obses'] = self.past_particles[i].obs_actions['obs']
+                self.dataset.values_dict[f'particle_{i}_actions'] = self.past_particles[i].obs_actions['actions']
         return
 
     def play_steps(self):        
@@ -167,6 +166,7 @@ class SRPAgent(CommonAgent):
             self._calc_stein_force_rewards(mb_obses, mb_actions)
             aux_nb_rewards = self.experience_buffer.tensor_dict['aux_rewards']
             aux_nb_returns = []
+            aux_values = []
             for i in range(self.num_particles):
                 nb_advs = self.discount_values(fdones, last_aux_values[i],
                                                mb_fdones, aux_nb_values[i],
@@ -174,9 +174,10 @@ class SRPAgent(CommonAgent):
                 nb_returns = nb_advs + aux_nb_values[i]
                 nb_returns = a2c_common.swap_and_flatten01(nb_returns)
                 aux_nb_returns.append(nb_returns)
+                aux_values.append(a2c_common.swap_and_flatten01(aux_nb_values[i]))
 
             batch_dict['aux_returns'] = torch.stack(aux_nb_returns, axis=0)
-            batch_dict['aux_values'] = aux_nb_values
+            batch_dict['aux_values'] = aux_values
 
         return batch_dict
 
@@ -221,6 +222,10 @@ class SRPAgent(CommonAgent):
             values['aux_values'] = result['aux_values'] if self.stein_phase else None                
             return values
 
+    def train_actor_critic(self, input_dict, mini_epoch, cur_id):
+        self.calc_gradients(input_dict, mini_epoch, cur_id)
+        return self.train_result
+
     def _calc_stein_force_rewards(self, mb_obses, mb_actions):
         input_dict = {
             'obs': mb_obses,
@@ -241,6 +246,9 @@ class SRPAgent(CommonAgent):
 
             rewards = rewards.view(horizon_length, -1, 1)
             self.experience_buffer.tensor_dict['aux_rewards'][i].copy_(rewards)
+
+    def _calc_pdf_loss(self):
+        pass
 
     def calc_gradients(self, input_dict, mini_epoch, cur_id):
         value_preds_batch = input_dict['old_values']
@@ -307,54 +315,72 @@ class SRPAgent(CommonAgent):
             a_loss, c_loss, entropy, b_loss = losses[0], losses[1], losses[2], losses[3]
 
             actor_loss = a_loss - entropy * self.entropy_coef + b_loss * self.bounds_loss_coef
-            critic_loss = 0.5 * c_loss * self.critic_coef
             # TODO: this
             pdf_loss = None
+
+            if self.num_effect_particles > self.num_particles - 1:
+                for i in range(self.num_particles):
+                    nb_obs_batch = input_dict[f'particle_{i}_obses']
+                    nb_actions_batch = input_dict[f'particle_{i}_actions']
+                    
+                    pass
 
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
             self.pdf_optimizer.zero_grad()
-
 
             # calculate stein repulsive force
             if self.stein_phase:
                 self.scaler.scale(actor_loss).backward(retain_graph=True)
                 grad_current_policy = parameters_to_vector((p.grad for p in self.actor_params)).detach()
                 assert grad_current_policy.size(0) == self.actor_pcnt
-                if self.update_particle and mini_epoch == 0:
-                    self.past_particles[self.current_index].update_gradients(index=cur_id, grads=grad_current_policy)
                 self.actor_optimizer.zero_grad()
 
                 grad_exploration = torch.zeros_like(grad_current_policy, device=self.ppo_device)
-                grad_exploitation = grad_current_policy.clone()
+                grad_exploitation = torch.zeros_like(grad_current_policy, device=self.ppo_device)
 
                 for i in range(self.num_particles):
+                    # exploration
                     nb_a_loss = self.actor_loss_func(old_action_log_probs_batch, action_log_probs, aux_advantages[i], self.ppo, curr_e_clip)
                     nb_a_loss = nb_a_loss.mean()
                     self.actor_optimizer.zero_grad()
-                    nb_a_loss.backward(retain_graph=(i!=self.num_particles-1))
+                    self.scaler.scale(nb_a_loss).backward(retain_graph=(i!=self.num_particles-1))
                     grad_stein_force = parameters_to_vector((p.grad for p in self.actor_params)).detach()
                     self.actor_optimizer.zero_grad()
-                    grad_exploration += kernel_vals[i] * grad_stein_force
+                    grad_exploration += self.kernel_vals[i] * grad_stein_force
 
+                    # exploitation
                     grad_nb = self.past_particles[i].grad_current_policy[cur_id]
                     assert grad_nb.size(0) == self.actor_pcnt
-                    grad_exploitation += kernel_vals[i] * grad_nb
-                
-                # gradient averaging
-                # TODO  
-                omega = anneal_coef if self.svpg_expl_wt is None else self.svpg_expl_wt
-                grad_avg = grad_exploration * omega + grad_exploitation * (1 - omega)
-                grad_avg /= (sum(kernel_vals.values()) + 1)
+                    grad_exploitation += self.kernel_vals[i] * grad_nb
 
-            else:
-                self.scaler.scale(actor_loss).backward()
-                self.scaler.scale(critic_loss).backward()
-                self.scaler.scale(pdf_loss).backward()
-                grad_current_policy = parameters_to_vector((p.grad for p in self.actor_params)).detach()
+                grad_stein = grad_exploitation + grad_exploration
+                grad_stein /= (sum(self.kernel_vals.values()) + 1)
+
+                # gradient averaging
+                # TODO
+                omega = self.anneal_coef if self._stein_repulsive_wt is None else self._stein_repulsive_wt
+                grad_avg = grad_current_policy + grad_stein * omega
+
+                # actor update
+                self.actor_optimizer.zero_grad()
+                vector_to_parameters(grad_avg, (p.grad for p in self.actor_params))
+
                 if self.update_particle and mini_epoch == 0:
                     self.past_particles[self.current_index].update_gradients(index=cur_id, grads=grad_current_policy)
 
+                for i in range(self.num_particles):
+                    aux_c_loss = common_losses.critic_loss(aux_value_preds_batch[i], aux_values[i], curr_e_clip, aux_return_batch[i], self.clip_value)
+                    c_loss += aux_c_loss.mean()
+            else:
+                self.scaler.scale(actor_loss).backward()
+                if self.update_particle and mini_epoch == 0:
+                    grad_current_policy = parameters_to_vector((p.grad for p in self.actor_params)).detach()
+                    self.past_particles[self.current_index].update_gradients(index=cur_id, grads=grad_current_policy)
+
+        critic_loss = 0.5 * c_loss * self.critic_coef
+        self.scaler.scale(critic_loss).backward()
+        self.scaler.scale(pdf_loss).backward()
 
         #TODO: Refactor this ugliest code of they year
         self.trancate_gradients_and_step(identity='actor')
